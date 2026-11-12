@@ -5,6 +5,12 @@ policy can be changed online. Page corrections and deletes continue to commit
 while a new index is being built; the old index serves searches until the new
 generation has caught up and is switched atomically.
 
+Researchers can also anchor **person/place annotations** to Unicode code-point
+spans of a page body. Local text corrections keep the annotation coordinates
+valid by translating them, and invalidate only the labels the edit actually
+touches — without ever holding a database write lock for the duration of the
+coordinate computation.
+
 ## Start with Docker Compose
 
 ```bash
@@ -133,6 +139,71 @@ curl --get "$BASE/api/search" --data-urlencode 'q=resume'
 Deleted `ocr-002` remains absent, and returned titles/bodies are the corrected
 committed versions from the same SQLite snapshot as the hit.
 
+### 7. Anchor a person/place label to the body
+
+Coordinates are **Unicode code-point** half-open intervals `[start, end)` into
+the current body; the server stores the exact selected original text and the
+revision the label is anchored to. Every write carries the **expected
+revision** — a stale revision is rejected with HTTP `409`.
+
+```bash
+# Body: "Le café est près de la gare; le señor lit un naïve résumé."
+# "señor" starts at code point 35, "gare" at 26.
+curl -sS -X POST "$BASE/api/pages/ocr-001/annotations" \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 1, "label": "person", "start": 35, "end": 40}'
+# 201 -> annotation id, selected_text "señor", status "active"
+
+curl -sS -X POST "$BASE/api/pages/ocr-001/annotations" \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 1, "label": "place", "start": 26, "end": 30}'
+```
+
+### 8. Apply a local correction and watch coordinates move
+
+`POST /api/pages/{page_id}/corrections` takes the expected revision and up to
+**20 mutually non-overlapping** replacements, all interpreted in the
+*pre-correction* coordinate space. Insertion points may not coincide or land
+inside another replacement.
+
+```bash
+# Replace "café" [3,7) with the longer "bistrot". Labels later in the text
+# have both endpoints translated; their selected text stays identical.
+curl -sS -X POST "$BASE/api/pages/ocr-001/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "revision": 1,
+    "replacements": [{"start": 3, "end": 7, "replacement": "bistrot"}]
+  }'
+# -> revision 2, annotations_migrated 2, annotations_invalidated 0
+```
+
+Coordinate rules:
+
+* An insertion at an annotation **start** counts as *before* it (both
+  endpoints shift); an insertion at the **end** counts as *after* it.
+* A replacement that intersects an annotation, or an insertion strictly
+  inside one, sets that annotation to `invalidated` and keeps its original
+  selected text. Edits that merely touch a boundary translate the label.
+* Replaying the same request against the old revision returns `409` and
+  changes nothing.
+
+### 9. Query body and labels from one snapshot
+
+```bash
+curl -sS "$BASE/api/pages/ocr-001/annotations"
+# Optional filter: ?status=active or ?status=invalidated
+```
+
+The response contains the committed `body`, its `revision`, and both active
+and invalidated annotations from the **same** SQLite snapshot. Every active
+span still slices exactly its `selected_text` out of the live body. All rows
+are durable in SQLite and survive a container restart.
+
+A full `PUT` rewrite or a `DELETE` invalidates every annotation on the page
+(`annotations_invalidated` is returned); re-creating the same page ID never
+revives the old labels.
+
 ## Accent examples
 
 | Document word | `keep` query | `fold` query |
@@ -152,9 +223,12 @@ non-Latin combining marks are preserved.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/api/pages/{page_id}` | Insert/replace an OCR title and body. |
-| `DELETE` | `/api/pages/{page_id}` | Idempotent delete. |
+| `PUT` | `/api/pages/{page_id}` | Insert/replace an OCR title and body; invalidates all annotations on the page. |
+| `DELETE` | `/api/pages/{page_id}` | Idempotent delete; invalidates all annotations on the page. |
 | `GET` | `/api/pages/{page_id}` | Read a committed page. |
+| `POST` | `/api/pages/{page_id}/annotations` | Anchor a `person`/`place` label to a code-point span at an expected revision. |
+| `GET` | `/api/pages/{page_id}/annotations` | Snapshot of the body with active and invalidated annotations (`?status=` filter). |
+| `POST` | `/api/pages/{page_id}/corrections` | Revision-fenced local correction (≤20 non-overlapping replacements) that migrates or invalidates annotations. |
 | `GET` | `/api/search?q=word` | Word search over the active FTS generation. |
 | `POST` | `/api/index/rebuild` | Queue/switch accent policy through a background rebuild. |
 | `GET` | `/api/index/status` | Active policy/generation, current job, progress, history. |
@@ -211,6 +285,47 @@ Retired FTS tables are deliberately retained rather than dropped in the swap
 transaction. This avoids schema-lock surprises for an already-running query;
 generation history is visible in `/api/index/status`.
 
+### Annotation and local-correction model
+
+* **Durable labels** — the `annotations` table stores the label, code-point
+  half-open interval, selected original text, `active`/`invalidated` status,
+  the anchor/creation revisions and an invalidation reason. Nothing lives only
+  in process memory, so a restart preserves every label.
+* **Revision fencing** — annotation creation and local correction both send
+  the revision the caller read. Under the final write lock the current
+  revision (and, for corrections, the exact body) is re-checked; a mismatch
+  fails with HTTP `409` and the whole transaction rolls back.
+* **No scan-length write lock** — a correction first opens a read-only
+  snapshot, validates the replacements and computes every annotation
+  migration in pure in-memory code. Only then does it take one short
+  `BEGIN IMMEDIATE` transaction. Annotations can therefore be added while a
+  correction is being calculated.
+* **Nothing added during computation is lost** — inside the write
+  transaction the active annotation set is re-read; if labels appeared during
+  the unlocked computation, their migration is recomputed before commit. A
+  concurrently committed annotation either joins the migration or its stale
+  fence is rejected explicitly; it is never silently dropped.
+* **Atomic commit across both worker processes** — the corrected page body,
+  every translated/invalidated annotation row, the `changes` log entry
+  (`op='correct'`, with the edit list and migration counts in `details`) and
+  the active FTS row update commit in a single SQLite transaction. A failure
+  makes none of it visible. The two uvicorn workers are serialised by the
+  `BEGIN IMMEDIATE` write lock; concurrent same-revision corrections have
+  exactly one winner, the rest receive `409`.
+* **Coordinate semantics** — edits are sorted and applied in pre-correction
+  coordinates. An insertion at a span start is *before* the span; at the end
+  it is *after* it. A half-open intersection with a replacement, or an
+  insertion strictly inside the span, invalidates the label while preserving
+  its original text.
+* **Bulk invalidation** — a full-page `PUT` or a `DELETE` invalidates all
+  active annotations in the same write transaction. The rows are retained,
+  and creating a page with the same ID afterwards starts with zero active
+  labels rather than resurrecting old ones.
+* **Rebuild interplay** — `correct` rows in the change log are replayed by a
+  background rebuild exactly like `upsert` rows, so the shadow generation
+  indexes the corrected body and the final swap stays consistent with the
+  canonical pages.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -236,3 +351,12 @@ pytest -q
 The tests exercise exact vs folded search, a rebuild that finishes with a
 correction and a deletion submitted during the scan, duplicate job idempotency,
 and restart/stale-job recovery. They use temporary SQLite files.
+
+The annotation suite (`tests/test_annotations.py`) covers label creation and
+selected-text snapshots, stale-revision `409` fencing, coordinate translation
+for disjoint edits, the start-before/end-after insertion rule, invalidation by
+intersecting replacements and inner insertions, overlap/coincident-point
+rejection, full-rewrite/delete invalidation without resurrection, restart
+durability (including the legacy-schema migration), a correction replayed into
+a concurrent rebuild, and cross-thread concurrency for annotations racing a
+correction and for competing corrections.

@@ -328,7 +328,7 @@ def _apply_change_rows(
     for row in rows:
         page_id = row["page_id"]
         page_ref = int(row["page_ref"]) if row["page_ref"] is not None else None
-        if row["op"] == "upsert":
+        if row["op"] in ("upsert", "correct"):
             _replace_document(
                 conn,
                 table,

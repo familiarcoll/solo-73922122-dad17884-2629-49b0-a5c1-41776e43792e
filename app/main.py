@@ -10,10 +10,25 @@ from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .accents import AccentPolicy
-from .archive import delete_page, get_page, search, upsert_page
+from .annotations import (
+    MAX_EDITS_PER_CORRECTION,
+    VALID_LABELS,
+    AnnotationError,
+    PageNotFoundError,
+    StaleRevisionError,
+)
+from .archive import (
+    add_annotation,
+    correct_page,
+    delete_page,
+    get_page,
+    list_annotations,
+    search,
+    upsert_page,
+)
 from .config import SETTINGS
 from .db import claim_rebuild, connect, fail_job, get_job, get_status, init_db
 from .rebuild import cancel_local_rebuilds, start_rebuild_thread
@@ -28,7 +43,36 @@ logger = logging.getLogger("archive.api")
 
 APP_DESCRIPTION = """
 Accent-aware OCR archive search backed by **SQLite FTS5**, with transactional
-page corrections and an online, background index rebuild.
+page corrections, **person/place text annotations** and an online, background
+index rebuild.
+
+### Annotations that survive local corrections
+
+Researchers label names and places with half-open **Unicode code-point**
+intervals into a page body. The server stores the exact selected original
+text and the revision the label was anchored to:
+
+* `POST /api/pages/{page_id}/annotations` creates one label against an
+  **expected revision**. A stale revision is rejected with HTTP `409`.
+* `POST /api/pages/{page_id}/corrections` applies up to **20 mutually
+  non-overlapping** replacements, all interpreted in the *pre-correction*
+  coordinate space. Insertion points may not coincide or land inside another
+  replacement.
+* Annotations fully outside the edited spans have their coordinates
+  **translated**: an insertion at an annotation start counts as *before* it
+  (both endpoints shift); an insertion at the end counts as *after* it.
+* A replacement intersecting an annotation, or an insertion strictly inside
+  one, **invalidates** that annotation while its original selected text is
+  retained.
+* A full page rewrite or a delete invalidates every annotation; re-creating
+  the same page ID never revives old labels.
+* The corrected body, every annotation migration, the change-log row and the
+  FTS update commit in one short transaction. Coordinate computation happens
+  *before* the write lock is taken, so annotations can still be added while a
+  correction is being calculated, and none of those new labels are lost.
+* `GET /api/pages/{page_id}/annotations` returns the body, revision and both
+  active and invalidated annotations from one snapshot. All state is durable
+  in SQLite and survives a restart.
 
 ### Index generations and accent policy
 
@@ -149,6 +193,125 @@ class RebuildRequest(BaseModel):
     )
 
 
+class AnnotationCreate(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Label a person name",
+                    "value": {
+                        "revision": 1,
+                        "label": "person",
+                        "start": 44,
+                        "end": 49,
+                    },
+                },
+                {
+                    "summary": "Label a place name",
+                    "value": {
+                        "revision": 1,
+                        "label": "place",
+                        "start": 23,
+                        "end": 27,
+                    },
+                },
+            ]
+        },
+    )
+
+    revision: int = Field(
+        ge=0,
+        description="The page revision the caller read. A mismatched revision is rejected with HTTP 409.",
+    )
+    label: str = Field(
+        description="Annotation label. Allowed values: `person` or `place`.",
+        examples=list(VALID_LABELS),
+    )
+    start: int = Field(
+        ge=0,
+        description="Inclusive start Unicode code point offset into the current body.",
+    )
+    end: int = Field(
+        ge=0,
+        description="Exclusive end Unicode code point offset; must be greater than `start`.",
+    )
+
+    @model_validator(mode="after")
+    def _check_span(self) -> "AnnotationCreate":
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        return self
+
+
+class Replacement(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Replace one misread word",
+                    "value": {"start": 3, "end": 7, "replacement": "café"},
+                },
+                {
+                    "summary": "Pure insertion at a code-point boundary",
+                    "value": {"start": 12, "end": 12, "replacement": " — note"},
+                },
+            ]
+        },
+    )
+
+    start: int = Field(ge=0, description="Inclusive start code point in the pre-correction body.")
+    end: int = Field(
+        ge=0,
+        description=(
+            "Exclusive end code point. Equal start/end is a pure insertion. "
+            "Intervals are half-open and all replacements are mutually "
+            "non-overlapping."
+        ),
+    )
+    replacement: str = Field(description="Replacement text; may be empty to delete the span.")
+
+    @model_validator(mode="after")
+    def _check_span(self) -> "Replacement":
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        return self
+
+
+class CorrectionRequest(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "summary": "Two disjoint local fixes at the current revision",
+                    "value": {
+                        "revision": 1,
+                        "replacements": [
+                            {"start": 3, "end": 7, "replacement": "café"},
+                            {"start": 40, "end": 44, "replacement": "gare"},
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+
+    revision: int = Field(
+        ge=0,
+        description="Expected current revision. Stale revisions are rejected with HTTP 409.",
+    )
+    replacements: list[Replacement] = Field(
+        min_length=1,
+        max_length=MAX_EDITS_PER_CORRECTION,
+        description=(
+            f"At most {MAX_EDITS_PER_CORRECTION} mutually non-overlapping "
+            "replacements, all interpreted in the pre-correction coordinates."
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -164,6 +327,14 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_tags=[
         {"name": "pages", "description": "Transactional OCR page writes and deletes."},
+        {
+            "name": "annotations",
+            "description": (
+                "Person/place labels anchored to Unicode code-point spans, with "
+                "revision-fenced local corrections that preserve or invalidate "
+                "the annotation coordinates."
+            ),
+        },
         {"name": "search", "description": "Word search over the active FTS5 generation."},
         {
             "name": "index",
@@ -172,6 +343,36 @@ app = FastAPI(
         {"name": "ops", "description": "Health and documentation helpers."},
     ],
 )
+
+
+@app.exception_handler(StaleRevisionError)
+async def stale_revision_handler(_request: Request, exc: StaleRevisionError):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "error": "stale_revision",
+            "page_id": exc.page_id,
+            "expected_revision": exc.expected,
+            "current_revision": exc.current,
+        },
+    )
+
+
+@app.exception_handler(PageNotFoundError)
+async def annotation_page_missing_handler(_request: Request, exc: PageNotFoundError):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": str(exc), "error": "page_not_found", "page_id": exc.page_id},
+    )
+
+
+@app.exception_handler(AnnotationError)
+async def annotation_error_handler(_request: Request, exc: AnnotationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": str(exc), "error": "annotation_validation"},
+    )
 
 
 @app.exception_handler(sqlite3.OperationalError)
@@ -301,6 +502,98 @@ def read_page(
     if page is None:
         raise HTTPException(status_code=404, detail="page not found")
     return page
+
+
+@app.post(
+    "/api/pages/{page_id}/annotations",
+    tags=["annotations"],
+    status_code=201,
+    summary="Anchor a person/place label to a body code-point span",
+    response_description=(
+        "The stored annotation with the selected original text. Stale revisions "
+        "return 409; coordinates outside the current body return 422."
+    ),
+)
+def create_annotation(
+    page_id: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=512,
+            description="Page the label belongs to, e.g. `ocr-001`.",
+            examples=["ocr-001"],
+        ),
+    ],
+    payload: Annotated[
+        AnnotationCreate,
+        Body(
+            description="Revision fence plus a half-open Unicode code-point interval. "
+            "The server records the exact selected original text."
+        ),
+    ],
+) -> dict:
+    return add_annotation(
+        page_id=page_id,
+        expected_revision=payload.revision,
+        label=payload.label,
+        start=payload.start,
+        end=payload.end,
+    )
+
+
+@app.post(
+    "/api/pages/{page_id}/corrections",
+    tags=["annotations"],
+    summary="Apply a revision-fenced local correction and migrate annotation coordinates",
+    response_description=(
+        "The new revision and body plus the counts of migrated and invalidated "
+        "annotations. Body, annotations, change log and the FTS index commit in "
+        "one transaction."
+    ),
+)
+def submit_correction(
+    page_id: Annotated[
+        str,
+        Path(min_length=1, max_length=512, description="Page to correct.", examples=["ocr-001"]),
+    ],
+    payload: Annotated[
+        CorrectionRequest,
+        Body(
+            description="Expected revision plus up to 20 non-overlapping replacements, "
+            "all interpreted in pre-correction coordinates."
+        ),
+    ],
+) -> dict:
+    return correct_page(
+        page_id=page_id,
+        expected_revision=payload.revision,
+        raw_edits=[item.model_dump() for item in payload.replacements],
+    )
+
+
+@app.get(
+    "/api/pages/{page_id}/annotations",
+    tags=["annotations"],
+    summary="Read the body with its active and invalidated annotations in one snapshot",
+    response_description=(
+        "Body, revision and annotations come from the same committed state. "
+        "Use `?status=active` or `?status=invalidated` to filter."
+    ),
+)
+def read_annotations(
+    page_id: Annotated[
+        str,
+        Path(min_length=1, max_length=512, description="Page to inspect.", examples=["ocr-001"]),
+    ],
+    status: Annotated[
+        str | None,
+        Query(
+            description="Optional annotation status filter.",
+            examples=["active", "invalidated"],
+        ),
+    ] = None,
+) -> dict:
+    return list_annotations(page_id, status)
 
 
 @app.get(

@@ -35,14 +35,33 @@ CREATE TABLE IF NOT EXISTS changes (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     page_id TEXT NOT NULL,
     page_ref INTEGER,
-    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
+    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete', 'correct')),
     title TEXT,
     body TEXT,
     rev INTEGER NOT NULL,
+    details TEXT,
     changed_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_changes_seq ON changes(seq);
+
+CREATE TABLE IF NOT EXISTS annotations (
+    annotation_id TEXT PRIMARY KEY,
+    page_id TEXT NOT NULL,
+    label TEXT NOT NULL CHECK (label IN ('person', 'place')),
+    start_cp INTEGER NOT NULL,
+    end_cp INTEGER NOT NULL,
+    selected_text TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'invalidated')),
+    anchor_rev INTEGER NOT NULL,
+    created_rev INTEGER NOT NULL,
+    invalidation_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    invalidated_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_annotations_page ON annotations(page_id, status);
 
 CREATE TABLE IF NOT EXISTS generations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,6 +223,38 @@ def init_db() -> None:
         if "page_ref" not in change_columns:
             conn.execute("ALTER TABLE changes ADD COLUMN page_ref INTEGER")
 
+        # The local-correction feature introduces op='correct' and a JSON
+        # details column.  SQLite cannot alter a CHECK constraint, so a
+        # database created by the older schema gets its change log rebuilt.
+        # The AUTOINCREMENT sequence in sqlite_sequence is preserved.
+        if "details" not in change_columns:
+            conn.execute(
+                """
+                CREATE TABLE changes_v2 (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    page_id TEXT NOT NULL,
+                    page_ref INTEGER,
+                    op TEXT NOT NULL CHECK (op IN ('upsert', 'delete', 'correct')),
+                    title TEXT,
+                    body TEXT,
+                    rev INTEGER NOT NULL,
+                    details TEXT,
+                    changed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO changes_v2
+                    (seq, page_id, page_ref, op, title, body, rev, changed_at)
+                SELECT seq, page_id, page_ref, op, title, body, rev, changed_at
+                  FROM changes
+                """
+            )
+            conn.execute("DROP TABLE changes")
+            conn.execute("ALTER TABLE changes_v2 RENAME TO changes")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_changes_seq ON changes(seq)")
+
         job_columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(rebuild_jobs)").fetchall()
@@ -251,8 +302,8 @@ def init_db() -> None:
                     "UPDATE generations SET fts_table = ? WHERE id = ?", (table, gen_id)
                 )
 
-        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('schema_version', '1')")
-        conn.execute("PRAGMA user_version = 1")
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('schema_version', '2')")
+        conn.execute("PRAGMA user_version = 2")
 
         # If a previous process disappeared, its job becomes immediately
         # retriggerable on startup.  The live index was never touched.
